@@ -9,6 +9,7 @@
 
 # Ignore git internal files (for bundler)
 .git/
+.idea/
 
 # Ignore all contents of the virtual environment directory
 .venv/
