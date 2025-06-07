@@ -3,13 +3,12 @@ import sys
 import time
 import socket
 import struct
-import asyncio
 from functools import wraps
 import threading
 import signal
 from flask import Flask, request, Response
 from flask_basicauth import BasicAuth
-from python.helpers import errors, files, git
+from python.helpers import errors, files, git, mcp_server
 from python.helpers.files import get_abs_path
 from python.helpers import persist_chat, runtime, dotenv, process
 from python.helpers.cloudflare_tunnel import CloudflareTunnel
@@ -17,8 +16,8 @@ from python.helpers.extract_tools import load_classes_from_folder
 from python.helpers.api import ApiHandler
 from python.helpers.job_loop import run_loop
 from python.helpers.print_style import PrintStyle
-from python.helpers.task_scheduler import TaskScheduler
 from python.helpers.defer import DeferredTask
+
 
 # Set the new timezone to 'UTC'
 os.environ["TZ"] = "UTC"
@@ -26,13 +25,13 @@ os.environ["TZ"] = "UTC"
 time.tzset()
 
 # initialize the internal Flask server
-app = Flask("app", static_folder=get_abs_path("./webui"), static_url_path="/")
-app.config["JSON_SORT_KEYS"] = False  # Disable key sorting in jsonify
+webapp = Flask("app", static_folder=get_abs_path("./webui"), static_url_path="/")
+webapp.config["JSON_SORT_KEYS"] = False  # Disable key sorting in jsonify
 
 lock = threading.Lock()
 
-# Set up basic authentication
-basic_auth = BasicAuth(app)
+# Set up basic authentication for UI and API but not MCP
+basic_auth = BasicAuth(webapp)
 
 
 def is_loopback_address(address):
@@ -123,7 +122,7 @@ def requires_auth(f):
 
 
 # handle default address, load index
-@app.route("/", methods=["GET"])
+@webapp.route("/", methods=["GET"])
 @requires_auth
 async def serve_index():
     gitinfo = None
@@ -147,11 +146,16 @@ def run():
     # Suppress only request logs but keep the startup messages
     from werkzeug.serving import WSGIRequestHandler
     from werkzeug.serving import make_server
+    from werkzeug.middleware.dispatcher import DispatcherMiddleware
+    from a2wsgi import ASGIMiddleware, WSGIMiddleware
+    from fastmcp.server.http import create_sse_app
+    from python.helpers.mcp_server import mcp_server as mcp_server_instance
 
     PrintStyle().print("Starting job loop...")
     job_loop = DeferredTask().start_task(run_loop)
 
     PrintStyle().print("Starting server...")
+
     class NoRequestLoggingWSGIRequestHandler(WSGIRequestHandler):
         def log_request(self, code="-", size="-"):
             pass  # Override to suppress request logging
@@ -178,8 +182,9 @@ def run():
                 PrintStyle().error(f"Failed to start Cloudflare tunnel: {e}")
                 PrintStyle().print("Continuing without tunnel...")
 
-        # initialize contexts from persisted chats
-        persist_chat.load_tmp_chats()
+        # # initialize contexts from persisted chats - moved to async task
+        # persist_chat.load_tmp_chats()
+
         # # reload scheduler
         # scheduler = TaskScheduler.get()
         # asyncio.run(scheduler.reload())
@@ -227,9 +232,20 @@ def run():
     # initialize and register API handlers
     handlers = load_classes_from_folder("python/api", "*.py", ApiHandler)
     for handler in handlers:
-        register_api_handler(app, handler)
+        register_api_handler(webapp, handler)
+
+    # add the webapp and mcp to the app
+    app = DispatcherMiddleware(
+        webapp,
+        {
+            "/mcp": ASGIMiddleware(app=mcp_server.DynamicMcpProxy.get_instance()),  # type: ignore
+        },
+    )
+    PrintStyle().debug("Registered middleware for MCP and MCP token")
 
     try:
+        PrintStyle().debug(f"Starting server at {host}:{port}...")
+
         server = make_server(
             host=host,
             port=port,
@@ -258,15 +274,22 @@ def run():
 
         process.set_server(server)
         server.log_startup()
+
+        # Start init_a0 in a background thread when server starts
+        import threading
+
+        threading.Thread(target=init_a0, daemon=True).start()
+
         server.serve_forever()
-        # Run Flask app
-        # app.run(
-        #     request_handler=NoRequestLoggingWSGIRequestHandler, port=port, host=host
-        # )
     finally:
         # Clean up tunnel if it was started
         if tunnel:
             tunnel.stop()
+
+
+def init_a0():
+    # initialize contexts from persisted chats
+    persist_chat.load_tmp_chats()
 
 
 # run the internal server
